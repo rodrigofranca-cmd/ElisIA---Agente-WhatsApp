@@ -1,133 +1,134 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { generateResponse } from '@/lib/gemini';
-import { 
-  sendWhatsAppMessage, 
-  markMessageAsRead, 
-  extractMessageFromWebhook 
-} from '@/lib/whatsapp';
+import { NextRequest, NextResponse } from 'next/server'
+import { GoogleGenerativeAI } from '@google/generative-ai'
 
-/**
- * GET /api/webhook
- * Endpoint para verificação do webhook pelo WhatsApp Cloud API
- * 
- * Quando você configura o webhook no Meta Business Suite,
- * o WhatsApp envia uma requisição GET com:
- * - hub.mode: "subscribe"
- * - hub.challenge: um código de desafio a ser retornado
- * - hub.verify_token: o token de verificação configurado
- */
+// Inicializa Gemini
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '')
+
+const STORE_NAME = 'ElisIA Store'
+
+// System prompt
+const SYSTEM_PROMPT = `Você é o ElisIA, assistente virtual da ${STORE_NAME}.
+Seja amigável, conciso e use emojis.
+Catálogo: Leite Condensado R$10, Sabão OMO R$5, Detergente Ypê R$3,50, Arroz Tio João R$25, Feijão R$15.
+Pagamento: Pix, Cartão 3x s/j, Dinheiro.
+Entrega: 3-5 dias úteis. Trocas em 7 dias.
+Horário: Seg-Sex 7h-18h.`
+
+// Histórico de conversas
+const conversations = new Map<string, Array<{role: string, content: string}>>()
+
+// GET - Verificação do webhook
 export async function GET(request: NextRequest) {
-  const searchParams = request.nextUrl.searchParams;
-  
-  const mode = searchParams.get('hub.mode');
-  const challenge = searchParams.get('hub.challenge');
-  const verifyToken = searchParams.get('hub.verify_token');
+  const { searchParams } = new URL(request.url)
+  const mode = searchParams.get('hub.mode')
+  const challenge = searchParams.get('hub.challenge')
+  const token = searchParams.get('hub.verify_token')
 
-  // Log para debug
-  console.log('[Webhook Verification] Recebido:', { mode, verifyToken });
+  console.log('Webhook verification:', { mode, token })
 
-  // Verifica se o modo é "subscribe" e se o token corresponde
-  if (mode === 'subscribe' && verifyToken === process.env.VERIFY_TOKEN) {
-    console.log('[Webhook Verification] Webhook verificado com sucesso!');
-    
-    // Retorna o challenge como texto puro (necessário para verificação)
-    return new NextResponse(challenge, {
-      status: 200,
-      headers: {
-        'Content-Type': 'text/plain',
-      },
-    });
+  if (mode === 'subscribe' && token === process.env.VERIFY_TOKEN) {
+    console.log('Webhook verified!')
+    return new NextResponse(challenge, { status: 200 })
   }
 
-  console.log('[Webhook Verification] Falha na verificação - token inválido');
-  
-  return NextResponse.json(
-    { error: 'Verificação falhou. Token inválido.' },
-    { status: 403 }
-  );
+  return NextResponse.json({ error: 'Verification failed' }, { status: 403 })
 }
 
-/**
- * POST /api/webhook
- * Endpoint para receber mensagens do WhatsApp Cloud API
- * 
- * Estrutura esperada do webhook:
- * {
- *   "entry": [{
- *     "changes": [{
- *       "value": {
- *         "messages": [{
- *           "from": "5511999999999",
- *           "id": "wamid.xxx",
- *           "text": { "body": "mensagem do usuário" }
- *         }]
- *       }
- *     }]
- *   }]
- * }
- */
+// POST - Receber mensagens
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json();
+    const body = await request.json()
+    console.log('Received webhook:', JSON.stringify(body, null, 2))
+
+    // Extrair dados da mensagem
+    const entry = body?.entry?.[0]?.changes?.[0]?.value
+    const message = entry?.messages?.[0]
+
+    if (!message) {
+      return NextResponse.json({ status: 'ignored' })
+    }
+
+    const from = message.from
+    const text = message.text?.body || ''
+
+    if (!text) {
+      return NextResponse.json({ status: 'ignored' })
+    }
+
+    console.log(`Message from ${from}: ${text}`)
+
+    // Gerar resposta com Gemini
+    const model = genAI.getGenerativeModel({ 
+      model: 'gemini-2.0-flash',
+      systemInstruction: SYSTEM_PROMPT
+    })
+
+    // Recuperar histórico
+    let history = conversations.get(from) || []
     
-    // Log completo do webhook recebido (útil para debug)
-    console.log('[Webhook] Mensagem recebida:', JSON.stringify(body, null, 2));
+    const chat = model.startChat({
+      history: history.map(h => ({
+        role: h.role as 'user' | 'model',
+        parts: [{ text: h.content }]
+      }))
+    })
 
-    // Extrai informações da mensagem
-    const messageData = extractMessageFromWebhook(body);
+    const result = await chat.sendMessage(text)
+    const responseText = result.response.text()
 
-    // Se não há mensagem (pode ser status de entrega, etc.)
-    if (!messageData) {
-      console.log('[Webhook] Nenhuma mensagem de usuário encontrada no payload');
-      return NextResponse.json({ status: 'ignored' }, { status: 200 });
-    }
+    // Salvar no histórico
+    history.push({ role: 'user', content: text })
+    history.push({ role: 'model', content: responseText })
+    if (history.length > 20) history = history.slice(-20)
+    conversations.set(from, history)
 
-    const { from, message, messageId, name } = messageData;
+    console.log(`Response: ${responseText}`)
 
-    console.log(`[Webhook] De: ${name || from} (${from})`);
-    console.log(`[Webhook] Mensagem: ${message}`);
+    // Enviar resposta para WhatsApp
+    const whatsappResponse = await fetch(
+      `https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_ID}/messages`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          messaging_product: 'whatsapp',
+          to: from,
+          type: 'text',
+          text: { body: responseText }
+        })
+      }
+    )
 
-    // Ignora mensagens vazias
-    if (!message || message.trim() === '') {
-      console.log('[Webhook] Mensagem vazia, ignorando');
-      return NextResponse.json({ status: 'ignored' }, { status: 200 });
-    }
+    const whatsappResult = await whatsappResponse.json()
+    console.log('WhatsApp response:', whatsappResult)
 
-    // Marca a mensagem como lida (mostra o "check" azul)
-    await markMessageAsRead(messageId);
+    // Marcar como lida
+    await fetch(
+      `https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_ID}/messages`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          messaging_product: 'whatsapp',
+          status: 'read',
+          message_id: message.id
+        })
+      }
+    )
 
-    // Gera resposta usando o Gemini
-    console.log('[Gemini] Gerando resposta...');
-    const geminiResponse = await generateResponse(message, from);
-    console.log(`[Gemini] Resposta: ${geminiResponse.substring(0, 100)}...`);
-
-    // Envia a resposta de volta para o WhatsApp
-    console.log('[WhatsApp] Enviando resposta...');
-    const sendResult = await sendWhatsAppMessage(from, geminiResponse);
-
-    if (sendResult.success) {
-      console.log('[WhatsApp] Resposta enviada com sucesso!');
-      return NextResponse.json({ 
-        status: 'success',
-        messageId: sendResult.messageId 
-      }, { status: 200 });
-    } else {
-      console.error('[WhatsApp] Erro ao enviar:', sendResult.error);
-      return NextResponse.json({ 
-        status: 'error',
-        error: sendResult.error 
-      }, { status: 500 });
-    }
+    return NextResponse.json({ status: 'success' })
 
   } catch (error) {
-    console.error('[Webhook] Erro ao processar:', error);
-    
+    console.error('Error:', error)
     return NextResponse.json(
-      { 
-        status: 'error', 
-        error: error instanceof Error ? error.message : 'Erro interno do servidor' 
-      },
+      { error: error instanceof Error ? error.message : 'Internal error' },
       { status: 500 }
-    );
+    )
   }
 }
